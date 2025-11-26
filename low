@@ -1,0 +1,193 @@
+-- #############################################
+-- Таблица тикеров, которые сейчас на минимуме
+-- за заданные периоды (по Close, дневки)
+-- Колонки: min 5 / 20 / 60 / 180 / 360 days
+-- В ячейках: тикеры, фон красный
+-- #############################################
+
+CLASS_CODE = "TQBR"
+TICKERS    = {
+    "SBER", "T", "VTBR", "SFIN", "SPBE", "SVCB", "MOEX", "LEAS", "BSPB", "RENI",
+    "CBOM", "MBNK", "ZAYM",
+    "PLZL", "GMKN", "NLMK", "CHMF", "MAGN", "MTLR", "ALRS", "RUAL", "SELG",
+    "UGLD", "TRMK", "ENPG", "RASP", "VSMO",
+    "LKOH", "GAZP", "NVTK", "ROSN", "SNGS", "TRNFP", "TATN", "RNFT", "BANE",
+    "YDEX", "VKCO", "HEAD", "ASTR",
+    "PIKK", "SMLT", "LSRG", "ETLN",
+    "AFLT", "FLOT", "NMTP", "FESH", "NKHP",
+    "OZON", "X5", "MGNT", "LENT", "BELU"
+}
+
+-- периоды в днях и заголовки колонок
+PERIODS = {
+    { days = 5,   title = "min 5 days"   },
+    { days = 20,  title = "min 20 days"  },
+    { days = 60,  title = "min 60 days"  },
+    { days = 180, title = "min 180 days" },
+    { days = 360, title = "min 360 days" }
+}
+
+is_run = true
+t_id   = nil
+sources = {}   -- чтобы корректно закрыть DataSource
+
+------------------------------------------------
+-- Служебные функции
+------------------------------------------------
+
+local function wait_for_ds(ds)
+    local tries = 0
+    while ds:Size() == 0 and tries < 50 do
+        sleep(100)
+        tries = tries + 1
+    end
+end
+
+local function ds_safe_close_all()
+    for _, ds in pairs(sources) do
+        if ds.Close then
+            pcall(function() ds:Close() end)
+        end
+    end
+end
+
+------------------------------------------------
+-- OnStop
+------------------------------------------------
+function OnStop()
+    is_run = false
+    if t_id ~= nil then
+        DestroyTable(t_id)
+    end
+    ds_safe_close_all()
+end
+
+------------------------------------------------
+-- main
+------------------------------------------------
+function main()
+
+    if #TICKERS == 0 then
+        message("Список TICKERS пуст.", 3)
+        return
+    end
+
+    ------------------------------------------------
+    -- 1. Для каждого периода будем собирать список тикеров
+    --    period_tickers[i] = { "GAZP", "LKOH", ... }
+    ------------------------------------------------
+    local period_tickers = {}
+    for i = 1, #PERIODS do
+        period_tickers[i] = {}
+    end
+
+    ------------------------------------------------
+    -- 2. Обрабатываем каждый тикер
+    ------------------------------------------------
+    for _, sec in ipairs(TICKERS) do
+        local ds, err = CreateDataSource(CLASS_CODE, sec, INTERVAL_D1)
+        if ds == nil then
+            message("Не удалось создать DataSource для "..sec..": "..tostring(err), 3)
+        else
+            sources[sec] = ds
+            wait_for_ds(ds)
+
+            local n = ds:Size()
+            if n < 2 then
+                -- мало истории, пропускаем
+            else
+                -- сегодняшнее закрытие (последняя дневка)
+                local last_idx = n - 1
+                local last_close = ds:C(last_idx)
+
+                -- для каждого периода проверяем, является ли сегодня минимумом
+                for pi, pd in ipairs(PERIODS) do
+                    local d = pd.days
+                    if n >= d then
+                        local start_idx = n - d     -- включительно
+                        local min_close = last_close
+
+                        -- ищем минимум Close за d дней (включая сегодняшний)
+                        for i = start_idx, last_idx do
+                            local c = ds:C(i)
+                            if c < min_close then
+                                min_close = c
+                            end
+                        end
+
+                        -- если сегодняшнее закрытие равно минимальному,
+                        -- считаем что бумага на лоу за период
+                        -- небольшой допуск на плавающую точку
+                        local eps = 0.0000001
+                        if math.abs(last_close - min_close) <= eps then
+                            table.insert(period_tickers[pi], sec)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    ------------------------------------------------
+    -- 3. Создаём таблицу
+    --    Колонки = периоды, строки = max кол-во тикеров среди колонок
+    ------------------------------------------------
+    t_id = AllocTable()
+
+    for col = 1, #PERIODS do
+        AddColumn(
+            t_id,
+            col,
+            PERIODS[col].title,
+            true,
+            QTABLE_CACHED_STRING_TYPE,
+            12
+        )
+    end
+
+    CreateWindow(t_id)
+    SetWindowCaption(t_id, "Tickers at period lows")
+
+    ------------------------------------------------
+    -- 4. Заполняем таблицу тикерами
+    ------------------------------------------------
+    -- определим, сколько максимум строк нужно
+    local max_rows = 0
+    for i = 1, #PERIODS do
+        local len = #period_tickers[i]
+        if len > max_rows then
+            max_rows = len
+        end
+    end
+
+    -- добавляем строки
+    for row = 1, max_rows do
+        local r = InsertRow(t_id, -1)
+
+        for col = 1, #PERIODS do
+            local tick_list = period_tickers[col]
+            local val = tick_list[row] or ""
+            SetCell(t_id, r, col, val)
+
+            if val ~= "" then
+                -- красный фон, белый текст
+                SetColor(
+                    t_id,
+                    r,
+                    col,
+                    RGB(255, 255, 255),   -- текст
+                    RGB(200, 0, 0),       -- фон
+                    RGB(255, 255, 255),   -- текст в выделении
+                    RGB(150, 0, 0)        -- фон в выделении
+                )
+            end
+        end
+    end
+
+    ------------------------------------------------
+    -- 5. Держим скрипт живым
+    ------------------------------------------------
+    while is_run do
+        sleep(1000)
+    end
+end
