@@ -1,0 +1,318 @@
+-- #############################################
+-- Таблица изменений цены закрытия за 30 дней
+-- строки  : тикеры
+-- столбцы : даты (30 последних торговых дней) + колонка LAST Δ
+-- ячейка  : Close(d) - Close(d-1) с цветом и знаком
+-- Итоговая строка: сумма объёмов торгов в рублях по всем тикерам (в млрд руб)
+-- #############################################
+
+CLASS_CODE = "TQBR"           -- класс бумаг (для акций Мосбиржи обычно TQBR)
+TICKERS    = {
+    "SBER", "T", "VTBR", "SFIN", "SBPE", "SVCB", "MOEX", "LEAS", "BSPB", "RENI",
+    "CBOM", "MBNK", "ZAYM",
+    "PLZL", "GMKN", "NLMK", "CHMF", "MAGN", "MTLR", "ALRS", "RUAL", "SELG",
+    "UGLD", "TRMK", "ENPG", "RASP", "VSMO",
+    "LKOH", "GAZP", "NVTK", "ROSN", "SNGS", "TRNFP", "TATN", "RNFT", "BANE",
+    "YDEX", "VKCO", "HEAD", "ASTR",
+    "PIKK", "SMLT", "LSRG", "ETLN",
+    "AFLT", "FLOT", "NMTP", "FESH", "NKHP",
+    "OZON", "X5", "MGNT", "LENT", "BELU"
+}
+DAYS       = 30               -- сколько торговых дней показывать
+
+is_run = true
+t_id   = nil
+sources = {}                  -- сюда сложим все DataSource, чтобы закрыть на OnStop
+
+------------------------------------------------
+-- Служебные функции
+------------------------------------------------
+
+local function wait_for_ds(ds)
+    -- Ждём, пока подгрузятся данные по инструменту
+    local tries = 0
+    while ds:Size() == 0 and tries < 50 do
+        sleep(100)
+        tries = tries + 1
+    end
+end
+
+local function ds_safe_close_all()
+    for _, ds in pairs(sources) do
+        if ds.Close then
+            pcall(function() ds:Close() end)
+        end
+    end
+end
+
+local function fmt_date(dt)
+    -- dt: таблица datetime {year, month, day, hour, min, sec}
+    return string.format("%02d.%02d", dt.day, dt.month)
+end
+
+------------------------------------------------
+-- OnStop: аккуратно останавливаем скрипт
+------------------------------------------------
+function OnStop()
+    is_run = false
+    if t_id ~= nil then
+        DestroyTable(t_id)
+    end
+    ds_safe_close_all()
+end
+
+------------------------------------------------
+-- main: основная логика
+------------------------------------------------
+function main()
+
+    --------------------------------------------
+    -- 1. Источник данных для первого тикера (заголовки дат)
+    --------------------------------------------
+    if #TICKERS == 0 then
+        message("Список TICKERS пуст, ничего строить.", 3)
+        return
+    end
+
+    local first_ticker = TICKERS[1]
+    local ds_first, err = CreateDataSource(CLASS_CODE, first_ticker, INTERVAL_D1)
+    if ds_first == nil then
+        message("Не удалось создать DataSource для "..first_ticker..": "..tostring(err), 3)
+        return
+    end
+    sources[first_ticker] = ds_first
+    wait_for_ds(ds_first)
+
+    local total = ds_first:Size()
+    if total < 2 then
+        message("Недостаточно данных по "..first_ticker, 3)
+        return
+    end
+
+    -- Нам нужно DAYS изменений => минимум DAYS+1 свеча
+    local needed = DAYS + 1
+    if total < needed then
+        DAYS = total - 1   -- уменьшим количество дней до доступного
+    end
+
+    -- Индекс первой свечи, по которой считаем изменение (Close(i) - Close(i-1))
+    local first_idx = total - DAYS       -- индекс в DataSource
+    local last_idx  = total - 1
+
+    -- Формируем заголовки дат по первому тикеру
+    local date_headers = {}
+    for i = first_idx, last_idx do
+        local dt = ds_first:T(i)
+        table.insert(date_headers, fmt_date(dt))
+    end
+
+    --------------------------------------------
+    -- 2. Создаём таблицу и колонки
+    --------------------------------------------
+    t_id = AllocTable()
+    -- 1-й столбец: тикер
+    AddColumn(t_id, 1, "TICKER", true, QTABLE_CACHED_STRING_TYPE, 10)
+
+    -- Далее столбцы с датами
+    for col = 1, #date_headers do
+        AddColumn(
+            t_id,
+            col + 1,                 -- 2..(DAYS+1)
+            date_headers[col],
+            true,
+            QTABLE_CACHED_STRING_TYPE,
+            8
+        )
+    end
+
+    -- Последний правый столбец: дельта текущей цены к вчерашнему close
+    local LAST_COL_INDEX = #date_headers + 2
+    AddColumn(
+        t_id,
+        LAST_COL_INDEX,
+        "LAST Δ",
+        true,
+        QTABLE_CACHED_STRING_TYPE,
+        10
+    )
+
+    CreateWindow(t_id)
+    SetWindowCaption(t_id, "Delta close for "..tostring(DAYS).." trade days")
+
+    --------------------------------------------
+    -- 3. Подготовка массива сумм объёмов по дням (в рублях)
+    --------------------------------------------
+    local vol_sums = {}
+    for i = 1, DAYS do
+        vol_sums[i] = 0
+    end
+
+    --------------------------------------------
+    -- 4. Заполняем строки по каждому тикеру
+    --------------------------------------------
+    for _, sec in ipairs(TICKERS) do
+        -- Источник данных по тикеру (дневки)
+        local ds, err2 = CreateDataSource(CLASS_CODE, sec, INTERVAL_D1)
+        if ds == nil then
+            message("Не удалось создать DataSource для "..sec..": "..tostring(err2), 3)
+        else
+            sources[sec] = ds
+            wait_for_ds(ds)
+
+            local n = ds:Size()
+            local row = InsertRow(t_id, -1)
+            SetCell(t_id, row, 1, sec)
+
+            -- размер лота для бумаги
+            local lot = 1
+            local si = getSecurityInfo(CLASS_CODE, sec)
+            if si ~= nil and si.lot_size ~= nil then
+                lot = tonumber(si.lot_size) or 1
+            end
+
+            if n >= 2 then
+                -- подстрахуемся: если данных меньше, чем у первого тикера
+                local local_days = DAYS
+                if n < DAYS + 1 then
+                    local_days = n - 1
+                end
+
+                local local_first_idx = n - local_days
+
+                -- заполняем от старого дня к новому
+                for col = 1, DAYS do
+                    local cell_col = col + 1
+
+                    if col <= local_days then
+                        local i = local_first_idx + (col - 1)  -- текущий день
+                        local prev_i = i - 1                    -- предыдущий день
+
+                        local c_today  = ds:C(i)
+                        local c_prev   = ds:C(prev_i)
+                        local diff = c_today - c_prev
+
+                        local sign_str
+                        if diff > 0 then
+                            sign_str = string.format("+%.2f", diff)
+                        elseif diff < 0 then
+                            sign_str = string.format("%.2f", diff) -- уже со знаком "-"
+                        else
+                            sign_str = "0.00"
+                        end
+
+                        SetCell(t_id, row, cell_col, sign_str)
+
+                        -- Цвет: зелёный для +, красный для -, нейтральный для 0
+                        if diff > 0 then
+                            SetColor(
+                                t_id,
+                                row,
+                                cell_col,
+                                RGB(0, 200, 0),      -- текст
+                                RGB(0, 0, 0),        -- фон
+                                RGB(0, 200, 0),      -- текст в выделении
+                                RGB(0, 0, 0)         -- фон в выделении
+                            )
+                        elseif diff < 0 then
+                            SetColor(
+                                t_id,
+                                row,
+                                cell_col,
+                                RGB(200, 0, 0),
+                                RGB(0, 0, 0),
+                                RGB(200, 0, 0),
+                                RGB(0, 0, 0)
+                            )
+                        end
+
+                        -- копим ОБЪЁМ В РУБЛЯХ по этому дню
+                        local vol = ds:V(i)
+                        if vol ~= nil then
+                            -- vol: объём в штуках/лотах, c_today: цена закрытия
+                            local trade_value_rub = vol * c_today * lot
+                            vol_sums[col] = (vol_sums[col] or 0) + trade_value_rub
+                        end
+                    else
+                        -- если для этого тикера нет столько истории,
+                        -- оставляем ячейку пустой
+                        SetCell(t_id, row, cell_col, "")
+                    end
+                end
+            end
+
+            ------------------------------------------------
+            -- LAST Δ: дельта текущей цены к последнему дневному закрытию
+            -- (LAST_param - Close(n-1)) + раскраска
+            ------------------------------------------------
+            local last_delta_str = ""
+            local last_delta_val = nil
+
+            local ok, p = pcall(getParamEx, CLASS_CODE, sec, "LAST")
+            if ok and p and p.param_value ~= nil and p.param_value ~= "" and n >= 1 then
+                local last_val = tonumber(p.param_value)
+                if last_val ~= nil then
+                    local last_close = ds:C(n - 1)
+                    local diff_last = last_val - last_close
+                    last_delta_val = diff_last
+
+                    if diff_last > 0 then
+                        last_delta_str = string.format("+%.2f", diff_last)
+                    elseif diff_last < 0 then
+                        last_delta_str = string.format("%.2f", diff_last)
+                    else
+                        last_delta_str = "0.00"
+                    end
+                end
+            end
+
+            SetCell(t_id, row, LAST_COL_INDEX, last_delta_str)
+
+            if last_delta_val ~= nil then
+                if last_delta_val > 0 then
+                    SetColor(
+                        t_id,
+                        row,
+                        LAST_COL_INDEX,
+                        RGB(0, 200, 0),
+                        RGB(0, 0, 0),
+                        RGB(0, 200, 0),
+                        RGB(0, 0, 0)
+                    )
+                elseif last_delta_val < 0 then
+                    SetColor(
+                        t_id,
+                        row,
+                        LAST_COL_INDEX,
+                        RGB(200, 0, 0),
+                        RGB(0, 0, 0),
+                        RGB(200, 0, 0),
+                        RGB(0, 0, 0)
+                    )
+                end
+            end
+        end
+    end
+
+    --------------------------------------------
+    -- 5. Итоговая строка с суммой объёмов (в млрд руб)
+    --------------------------------------------
+    local total_row = InsertRow(t_id, -1)
+    SetCell(t_id, total_row, 1, "VOL, bln RUB")
+
+    for col = 1, DAYS do
+        local cell_col = col + 1
+        local v = vol_sums[col] or 0
+        local v_bln = v / 1000000000.0
+        SetCell(t_id, total_row, cell_col, string.format("%.2f", v_bln))
+    end
+
+    -- LAST Δ для итоговой строки оставляем пустым
+    SetCell(t_id, total_row, LAST_COL_INDEX, "")
+
+    --------------------------------------------
+    -- 6. Держимскрипт живым, пока не остановят
+    --------------------------------------------
+    while is_run do
+        sleep(1000)
+    end
+end
